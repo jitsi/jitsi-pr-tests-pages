@@ -1,0 +1,47 @@
+name: prune-old-reports
+on:
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    env:
+      RETENTION_DAYS: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "jitsi-ci"
+          git config user.email "jitsi-ci@users.noreply.github.com"
+
+      - name: Delete old build directories
+        run: |
+          set -euo pipefail
+          CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" +%s)
+
+          deleted=0
+          # Build directories live at <repo>/PR-<n>/<build>/
+          while IFS= read -r dir; do
+            ts=$(git log -1 --format=%ct -- "$dir" || echo 0)
+            if [ "$ts" -gt 0 ] && [ "$ts" -lt "$CUTOFF" ]; then
+              echo "Removing $dir (last touched $(date -u -d @$ts -Iseconds))"
+              git rm -rf "$dir" >/dev/null
+              deleted=$((deleted + 1))
+            fi
+          done < <(find . -mindepth 3 -maxdepth 3 -type d -not -path './.git/*' -not -path './.github/*')
+
+          if [ "$deleted" -gt 0 ]; then
+            git commit -m "prune: removed $deleted build dir(s) older than ${RETENTION_DAYS}d"
+            git push
+          else
+            echo "Nothing to prune."
+          fi
