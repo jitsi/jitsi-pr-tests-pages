@@ -3,45 +3,104 @@ on:
   schedule:
     - cron: '0 4 * * *'
   workflow_dispatch:
+    inputs:
+      retention_days:
+        description: 'Keep build dirs published within this many days'
+        required: false
+        default: '30'
 
 permissions:
   contents: write
+
+# Only one writer-rewriter at a time. Publishes come from Jenkins (not Actions)
+# so this doesn't gate them — the force-with-lease push below guards that race.
+concurrency:
+  group: gh-pages-prune
+  cancel-in-progress: false
 
 jobs:
   prune:
     runs-on: ubuntu-latest
     env:
-      RETENTION_DAYS: 60
+      RETENTION_DAYS: ${{ github.event.inputs.retention_days || '30' }}
     steps:
+      # Shallow is enough: age comes from the .published_at stamp (see below),
+      # not from git history, so we never need to clone the (large) history.
       - uses: actions/checkout@v4
         with:
           ref: gh-pages
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Configure git
         run: |
           git config user.name  "jitsi-ci"
           git config user.email "jitsi-ci@users.noreply.github.com"
 
-      - name: Delete old build directories
+      - name: Prune old build dirs and flatten history
         run: |
           set -euo pipefail
-          CUTOFF=$(date -u -d "${RETENTION_DAYS} days ago" +%s)
+          NOW=$(date -u +%s)
+          CUTOFF=$(( NOW - RETENTION_DAYS * 86400 ))
 
-          deleted=0
-          # Build directories live at <repo>/PR-<n>/<build>/
-          while IFS= read -r dir; do
-            ts=$(git log -1 --format=%ct -- "$dir" || echo 0)
-            if [ "$ts" -gt 0 ] && [ "$ts" -lt "$CUTOFF" ]; then
-              echo "Removing $dir (last touched $(date -u -d @$ts -Iseconds))"
-              git rm -rf "$dir" >/dev/null
-              deleted=$((deleted + 1))
-            fi
-          done < <(find . -mindepth 3 -maxdepth 3 -type d -not -path './.git/*' -not -path './.github/*')
+          # Why flatten instead of plain `git rm`:
+          #   `git rm` only drops files from the branch tip; every blob ever
+          #   pushed stays reachable from history, so .git grows without bound
+          #   no matter how aggressively we prune. Each build publishes a full
+          #   Allure report + a multi-MB test-reports.zip, so this adds up fast
+          #   (~1GB and climbing). Collapsing gh-pages to a single orphan commit
+          #   of the retained tree makes all old blobs unreachable so GitHub gc
+          #   can reclaim them — that's what actually keeps the repo small.
+          #
+          # Why a .published_at stamp instead of `git log -1 --format=%ct`:
+          #   flattening resets every surviving dir's commit date to the flatten
+          #   commit, so git-history-based age would think everything is "new"
+          #   the day after the first flatten and never prune again. Instead each
+          #   build dir carries a durable epoch stamp. Dirs without one (legacy,
+          #   or just-published) are stamped NOW on first sight, so they age out
+          #   ~RETENTION_DAYS from when prune first saw them (i.e. within a day
+          #   of publish). publish-pr-results.sh may also write this stamp at
+          #   publish time for exact ages; this step is self-sufficient either way.
+          prune_tree() {
+            local kept=0 deleted=0 stamped=0 dir stamp ts
+            while IFS= read -r dir; do
+              stamp="$dir/.published_at"
+              if [ ! -f "$stamp" ]; then echo "$NOW" > "$stamp"; stamped=$((stamped+1)); fi
+              ts=$(cat "$stamp" 2>/dev/null || echo "$NOW")
+              case "$ts" in ''|*[!0-9]*) ts=$NOW ;; esac
+              if [ "$ts" -lt "$CUTOFF" ]; then
+                echo "  delete $dir (published $(date -u -d "@$ts" -Iseconds))"
+                rm -rf "$dir"; deleted=$((deleted+1))
+              else
+                kept=$((kept+1))
+              fi
+            done < <(find . -mindepth 3 -maxdepth 3 -type d -not -path './.git/*' -not -path './.github/*')
+            echo "  kept=$kept deleted=$deleted newly-stamped=$stamped"
+          }
 
-          if [ "$deleted" -gt 0 ]; then
-            git commit -m "prune: removed $deleted build dir(s) older than ${RETENTION_DAYS}d"
-            git push
-          else
-            echo "Nothing to prune."
-          fi
+          # Build the flattened branch from the freshest remote tip and push with
+          # a compare-and-swap (--force-with-lease). If a build was published
+          # since we fetched, the lease fails and we retry on the new tip — so a
+          # concurrent publish is never silently dropped.
+          # NB: invoked from `if`, so set -e is disabled inside — guard each
+          # critical step with `|| return 1` and let the push be the last
+          # command so its exit status is the function's.
+          attempt_push() {
+            local n="$1" base
+            git fetch -q origin gh-pages || return 1
+            base=$(git rev-parse FETCH_HEAD) || return 1
+            git checkout -q -f -B "staging${n}" "$base" || return 1
+            echo "attempt ${n}: base=${base:0:7}"
+            prune_tree
+            git checkout -q --orphan "flat${n}" || return 1
+            git add -A || return 1
+            git commit -q -m "prune: ${RETENTION_DAYS}d retention (flattened history)" || return 1
+            git push --force-with-lease="gh-pages:${base}" origin "flat${n}:gh-pages"
+          }
+
+          for n in 1 2 3 4 5; do
+            if attempt_push "$n"; then echo "pushed on attempt ${n}."; exit 0; fi
+            echo "remote moved or push failed; retrying (${n})..."
+            sleep 5
+          done
+          echo "prune failed after retries" >&2
+          exit 1
