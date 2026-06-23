@@ -8,6 +8,11 @@ on:
         description: 'Keep build dirs published within this many days'
         required: false
         default: '30'
+      purge_zips:
+        description: 'Also strip every test-reports.zip from the tree (one-time cleanup of the legacy in-tree zips)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -23,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RETENTION_DAYS: ${{ github.event.inputs.retention_days || '30' }}
+      PURGE_ZIPS: ${{ github.event.inputs.purge_zips || 'false' }}
     steps:
       # Shallow is enough: age comes from the .published_at stamp (see below),
       # not from git history, so we never need to clone the (large) history.
@@ -46,10 +52,10 @@ jobs:
           #   `git rm` only drops files from the branch tip; every blob ever
           #   pushed stays reachable from history, so .git grows without bound
           #   no matter how aggressively we prune. Each build publishes a full
-          #   Allure report + a multi-MB test-reports.zip, so this adds up fast
-          #   (~1GB and climbing). Collapsing gh-pages to a single orphan commit
-          #   of the retained tree makes all old blobs unreachable so GitHub gc
-          #   can reclaim them — that's what actually keeps the repo small.
+          #   Allure report (test-reports.zip now lives in a Release asset, not
+          #   the tree). Collapsing gh-pages to a single orphan commit of the
+          #   retained tree makes all old blobs unreachable so GitHub gc can
+          #   reclaim them — that's what actually keeps the repo small.
           #
           # Why a .published_at stamp instead of `git log -1 --format=%ct`:
           #   flattening resets every surviving dir's commit date to the flatten
@@ -77,6 +83,19 @@ jobs:
             echo "  kept=$kept deleted=$deleted newly-stamped=$stamped"
           }
 
+          # One-time (or belt-and-suspenders) cleanup: test-reports.zip is no
+          # longer published into the tree — it goes to a Release asset — but the
+          # ~8.6GB of legacy in-tree zips stay reachable until a flatten drops
+          # them. Run this workflow once with purge_zips=true to strip them all;
+          # after the publish-side change no new zips ever land here, so leaving
+          # it false on the scheduled runs is fine and cheap.
+          purge_zips() {
+            local n
+            n=$(find . -type f -name 'test-reports.zip' -not -path './.git/*' | wc -l)
+            echo "  purging $n test-reports.zip file(s) from the tree"
+            find . -type f -name 'test-reports.zip' -not -path './.git/*' -delete
+          }
+
           # Build the flattened branch from the freshest remote tip and push with
           # a compare-and-swap (--force-with-lease). If a build was published
           # since we fetched, the lease fails and we retry on the new tip — so a
@@ -91,6 +110,7 @@ jobs:
             git checkout -q -f -B "staging${n}" "$base" || return 1
             echo "attempt ${n}: base=${base:0:7}"
             prune_tree
+            if [ "${PURGE_ZIPS}" = "true" ]; then purge_zips; fi
             git checkout -q --orphan "flat${n}" || return 1
             git add -A || return 1
             git commit -q -m "prune: ${RETENTION_DAYS}d retention (flattened history)" || return 1
@@ -104,3 +124,25 @@ jobs:
           done
           echo "prune failed after retries" >&2
           exit 1
+
+      # The per-build test-reports.zip now lives as a Release asset tagged
+      # reports-<repo>-PR-<n>-<build> (see publish-pr-results.sh). Releases don't
+      # touch the Pages build, but left unbounded they'd accumulate one per
+      # build forever — so age them out on the same retention as the dirs.
+      - name: Prune old report release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          NOW=$(date -u +%s)
+          CUTOFF=$(( NOW - RETENTION_DAYS * 86400 ))
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName,createdAt \
+              --jq '.[] | select(.tagName | startswith("reports-")) | [.tagName, .createdAt] | @tsv' \
+          | while IFS=$'\t' read -r tag created; do
+              ts=$(date -u -d "$created" +%s)
+              if [ "$ts" -lt "$CUTOFF" ]; then
+                echo "  delete release $tag (created $created)"
+                gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+              fi
+            done
