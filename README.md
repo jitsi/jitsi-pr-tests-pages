@@ -15,7 +15,8 @@ that changes them.
 
 The queue page, <https://jitsi.github.io/jitsi-pr-tests-pages/queue/>, lists the PR test runs
 of jitsi-meet, lib-jitsi-meet, jicofo, jitsi-videobridge and jicoco that are waiting or running.
-It reads the public GitHub API from the browser, without a token.
+It reads the public GitHub API from the browser, without a token, and lists the runs
+that finished in the last 48 hours with the result from each build's `result.json`.
 
 ## URL layout
 
@@ -26,6 +27,7 @@ under this structure on the `gh-pages` branch:
 ```
 <source-repo>/PR-<pr-number>/<build-number>/
   index.html              # landing page with links
+  result.json             # the result, as in the PR check (read by the queue page)
   test-reports.zip        # full archive of the run
   log.txt                 # build log
   chrome-chrome/          # Allure HTML report (Chrome / Chrome)

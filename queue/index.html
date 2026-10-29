@@ -19,15 +19,17 @@
          color: var(--fg); background: var(--bg); }
   a { color: var(--link); }
   code { background: var(--code); padding: 0.1em 0.3em; border-radius: 3px; }
+  h2 { margin-top: 2em; }
   .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em 1em; margin: 1em 0; }
   button { font: inherit; padding: 0.3em 0.9em; cursor: pointer; }
   .table { overflow-x: auto; }
   table { border-collapse: collapse; width: 100%; }
   th, td { text-align: left; padding: 0.45em 0.6em; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { font-weight: 600; white-space: nowrap; }
-  td.repo, td.when, td.state { white-space: nowrap; }
-  .testing { color: var(--testing); font-weight: 600; }
+  td.repo, td.when, td.state, td.links { white-space: nowrap; }
+  .testing, .passed { color: var(--testing); font-weight: 600; }
   .waiting { color: var(--waiting); }
+  .failed { color: var(--error); font-weight: 600; }
   .error { color: var(--error); }
   .muted, small { color: var(--muted); }
   small { display: block; font-size: 0.8em; line-height: 1.5; margin-top: 1.5em; }
@@ -54,16 +56,29 @@ Each repo's runner takes one run at a time, and the test machine tests one run a
 <p id="empty" class="muted" hidden>Nothing is waiting or running.</p>
 <p id="errors" class="error" hidden></p>
 
+<h2>Finished in the last 48 hours</h2>
+<div class="table">
+  <table>
+    <thead>
+      <tr><th>Repo</th><th>PR</th><th>Started by</th><th>Result</th><th>Finished</th><th>Links</th></tr>
+    </thead>
+    <tbody id="finished"></tbody>
+  </table>
+</div>
+<p id="finished-empty" class="muted" hidden>No PR was tested in the last 48 hours.</p>
+
 <small>
   <b>Waiting for the runner</b>: the repo's runner is busy with an earlier run of the same repo.
   <b>Waiting for the test machine</b>: the run has its runner and waits for the run that is testing.
   Of the runs that have their runner, the one that got it first is shown as testing. That is almost always right,
   the run log on GitHub shows it for sure.<br>
+  The results of the finished runs are those of the PR check. Older builds, published before the reports
+  carried their result, show "in the report".<br>
   This page reads the public GitHub API from your browser, without signing in. GitHub allows 60 such requests an
-  hour per IP address, shared by everyone behind the same address, and one refresh uses 5 to 10 of them, so about
-  6 to 12 refreshes an hour. The page refreshes every 10 minutes while it is open. <span id="rate"></span><br>
+  hour per IP address, shared by everyone behind the same address, and one refresh uses 6 to 12 of them, so about
+  5 to 10 refreshes an hour. The page refreshes every 10 minutes while it is open. <span id="rate"></span><br>
   To run the tests of a PR again, comment <code>test this please</code> on it.
-  Reports of finished runs: <a href="../">jitsi.github.io/jitsi-pr-tests-pages</a>.
+  All the reports: <a href="../">jitsi.github.io/jitsi-pr-tests-pages</a>.
 </small>
 
 <script>
@@ -71,11 +86,20 @@ Each repo's runner takes one run at a time, and the test machine tests one run a
 
 const REPOS = [ 'jitsi-meet', 'lib-jitsi-meet', 'jicofo', 'jitsi-videobridge', 'jicoco' ];
 const API = 'https://api.github.com/repos/jitsi/';
+const PAGES = 'https://jitsi.github.io/jitsi-pr-tests-pages/';
 const WAITING = new Set([ 'queued', 'waiting', 'pending', 'requested' ]);
 const REFRESH_MS = 10 * 60 * 1000;
+const FINISHED_MS = 48 * 3600 * 1000;
+const PAGES_DELAY_MS = 15 * 60 * 1000;
 
-// Open PRs per repo, kept between refreshes; fetched again only when a run's PR isn't in them.
+// A run that didn't test (comments that aren't a trigger, PRs that need an admin) ends within a minute
+const TESTED_MIN_MS = 2 * 60 * 1000;
+
+// Open PRs per repo, kept between refreshes; fetched again only when an active run's PR isn't in them.
 const pullsCache = {};
+
+// result.json of the finished builds by run id; a published build doesn't change.
+const resultsCache = {};
 let rate = null;
 let lastRefresh = 0;
 let loading = false;
@@ -105,6 +129,11 @@ function time(date) {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+function dayAndTime(date) {
+    return new Date().toDateString() === date.toDateString() ? time(date)
+        : `${date.toLocaleDateString([], { weekday: 'short' })} ${time(date)}`;
+}
+
 function ago(date) {
     const minutes = Math.max(0, Math.round((Date.now() - date) / 60000));
 
@@ -132,38 +161,114 @@ function findPr(run, pulls) {
     }
 }
 
-async function prOf(repo, run) {
-    // For runs on the default branch (comments, the Actions tab) pull_requests lists unrelated PRs
+// The PR of a run without asking the API again: for runs on the default branch (comments, the Actions tab)
+// pull_requests lists unrelated PRs, and the release of a published build names its PR.
+function knownPr(repo, run, published) {
     if (run.event === 'pull_request_target' && run.pull_requests.length === 1) {
         return { number: run.pull_requests[0].number, title: run.display_title };
     }
-    if (run.event === 'workflow_dispatch') {
-        return null;
+
+    const release = published[run.id];
+
+    if (release) {
+        // Runs from the Actions tab are all named after the workflow
+        const open = run.event === 'workflow_dispatch' && pullsCache[repo]
+            && pullsCache[repo].find(pr => pr.number === release.pr);
+
+        return {
+            number: release.pr,
+            title: run.event === 'workflow_dispatch' ? open ? open.title : '' : run.display_title
+        };
     }
 
-    let pr = pullsCache[repo] && findPr(run, pullsCache[repo]);
+    const pr = pullsCache[repo] && findPr(run, pullsCache[repo]);
 
-    if (!pr) {
-        pullsCache[repo] = await get(`${repo}/pulls?state=open&sort=updated&direction=desc&per_page=100`);
-        pr = findPr(run, pullsCache[repo]);
+    return pr ? { number: pr.number, title: pr.title } : null;
+}
+
+async function prOf(repo, run, published) {
+    let pr = knownPr(repo, run, published);
+
+    if (pr || run.event === 'workflow_dispatch') {
+        return pr;
     }
+
+    pullsCache[repo] = await get(`${repo}/pulls?state=open&sort=updated&direction=desc&per_page=100`);
+    pr = findPr(run, pullsCache[repo]);
 
     return pr ? { number: pr.number, title: pr.title } : { number: null, title: run.display_title };
 }
 
-async function activeRuns(repo) {
-    // A queued run can wait for hours, but not for a day: the jobs time out
-    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+function isTested(run) {
+    return run.status === 'completed' && run.conclusion !== 'skipped'
+        && new Date(run.updated_at) - new Date(run.run_started_at) >= TESTED_MIN_MS
+        && Date.now() - new Date(run.updated_at) <= FINISHED_MS;
+}
+
+async function repoRuns(repo, published) {
+    // The newest 100 runs of the last 48 hours: a queued run can wait for hours, but its jobs time out in a day,
+    // and comment runs that don't test are many but quick
+    const since = new Date(Date.now() - FINISHED_MS).toISOString().replace(/\.\d+Z$/, 'Z');
     const data = await get(`${repo}/actions/workflows/pr-torture-trigger.yml/runs?per_page=100`
         + `&created=${encodeURIComponent('>=' + since)}`);
-    const runs = data.workflow_runs.filter(run => run.status === 'in_progress' || WAITING.has(run.status));
-    const rows = [];
+    const active = [];
+    const finished = [];
 
-    for (const run of runs) {
-        rows.push({ repo, run, pr: await prOf(repo, run) });
+    for (const run of data.workflow_runs) {
+        if (run.status === 'in_progress' || WAITING.has(run.status)) {
+            active.push({ repo, run, pr: await prOf(repo, run, published) });
+        } else if (isTested(run)) {
+            const pr = knownPr(repo, run, published) || (run.event === 'workflow_dispatch'
+                ? null : { number: null, title: run.display_title });
+
+            finished.push({ repo, run, pr });
+        }
     }
 
-    return { rows, truncated: data.total_count > data.workflow_runs.length };
+    return { active, finished };
+}
+
+// The builds published to the pages site, by run id: "jitsi/<repo>#<pr> build gha-<run id>"
+async function publishedBuilds() {
+    const releases = await get('jitsi-pr-tests-pages/releases?per_page=100');
+    const builds = {};
+
+    for (const release of releases) {
+        const match = /^jitsi\/([\w.-]+)#(\d+) build gha-(\d+)$/.exec(release.name || '');
+
+        if (match) {
+            builds[match[3]] = { repo: match[1], pr: Number(match[2]) };
+        }
+    }
+
+    return builds;
+}
+
+function reportUrl(row) {
+    return `${PAGES}${row.repo}/PR-${row.pr.number}/gha-${row.run.id}/`;
+}
+
+async function resultOf(row) {
+    if (!row.pr || !row.pr.number) {
+        return null;
+    }
+    if (!(row.run.id in resultsCache)) {
+        try {
+            const res = await fetch(`${reportUrl(row)}result.json`);
+            const result = res.ok ? await res.json() : null;
+
+            // The pages site is rebuilt a few minutes after a publish: look again for a missing result until then
+            if (result || Date.now() - new Date(row.run.updated_at) > PAGES_DELAY_MS) {
+                resultsCache[row.run.id] = result;
+            }
+
+            return result;
+        } catch {
+            return null;
+        }
+    }
+
+    return resultsCache[row.run.id];
 }
 
 function link(href, text) {
@@ -190,6 +295,22 @@ function cell(tr, content, className) {
     return td;
 }
 
+function prCell(tr, repo, pr) {
+    const td = cell(tr, null);
+
+    if (pr && pr.number) {
+        td.append(link(`https://github.com/jitsi/${repo}/pull/${pr.number}`, `#${pr.number}`));
+        if (pr.title) {
+            td.append(` ${pr.title}`);
+        }
+    } else if (pr) {
+        td.textContent = pr.title;
+    } else {
+        td.textContent = 'the PR number is in the run';
+        td.className = 'muted';
+    }
+}
+
 function render(rows) {
     // A run's updated_at is when it last changed state: for a started run, when it got its runner
     const started = rows.filter(row => row.run.status === 'in_progress')
@@ -202,18 +323,9 @@ function render(rows) {
     for (const row of [ ...started, ...waiting ]) {
         const tr = tbody.insertRow();
         const { repo, run, pr } = row;
+
         cell(tr, repo, 'repo');
-
-        const prCell = cell(tr, null);
-
-        if (pr && pr.number) {
-            prCell.append(link(`https://github.com/jitsi/${repo}/pull/${pr.number}`, `#${pr.number}`), ` ${pr.title}`);
-        } else if (pr) {
-            prCell.textContent = pr.title;
-        } else {
-            prCell.textContent = 'the PR number is in the run';
-            prCell.className = 'muted';
-        }
+        prCell(tr, repo, pr);
         cell(tr, startedBy(run));
 
         let state, className, since;
@@ -234,7 +346,54 @@ function render(rows) {
         cell(tr, link(run.html_url, 'run'));
     }
 
+    document.getElementById('empty').hidden = rows.length > 0;
+
     return { started: started.length, waiting: waiting.length };
+}
+
+async function renderFinished(rows) {
+    rows.sort((a, b) => new Date(b.run.updated_at) - new Date(a.run.updated_at));
+
+    const results = await Promise.all(rows.map(resultOf));
+    const tbody = document.getElementById('finished');
+
+    tbody.replaceChildren();
+    rows.forEach((row, i) => {
+        const tr = tbody.insertRow();
+        const { repo, run, pr } = row;
+        const result = results[i];
+
+        cell(tr, repo, 'repo');
+        prCell(tr, repo, pr);
+        cell(tr, startedBy(run));
+
+        const resultCell = cell(tr, null);
+
+        if (run.conclusion === 'cancelled') {
+            resultCell.textContent = 'Cancelled';
+            resultCell.className = 'muted';
+        } else if (result) {
+            const label = document.createElement('span');
+
+            label.textContent = { success: 'Passed', failure: 'Failed' }[result.conclusion] || 'No result';
+            label.className = { success: 'passed', failure: 'failed' }[result.conclusion] || 'muted';
+            resultCell.append(label, ` ${result.title}`);
+        } else {
+            resultCell.textContent = 'in the report';
+            resultCell.className = 'muted';
+        }
+
+        cell(tr, dayAndTime(new Date(run.updated_at)), 'when');
+
+        const links = cell(tr, null, 'links');
+
+        if (pr && pr.number && run.conclusion !== 'cancelled') {
+            links.append(link(reportUrl(row), 'report'), ' · ');
+        }
+        links.append(link(run.html_url, 'run'));
+    });
+
+    document.getElementById('finished-empty').hidden = rows.length > 0;
 }
 
 async function refresh() {
@@ -250,17 +409,27 @@ async function refresh() {
     button.disabled = true;
     status.textContent = 'Loading…';
 
-    const results = await Promise.allSettled(REPOS.map(activeRuns));
-    const rows = [];
     const problems = [];
     let limited = false;
+    let published = {};
+
+    try {
+        published = await publishedBuilds();
+    } catch (error) {
+        limited = Boolean(error.limited);
+        if (!limited) {
+            problems.push(`The published builds: ${error.message}.`);
+        }
+    }
+
+    const results = await Promise.allSettled(REPOS.map(repo => repoRuns(repo, published)));
+    const active = [];
+    const finished = [];
 
     results.forEach((result, i) => {
         if (result.status === 'fulfilled') {
-            rows.push(...result.value.rows);
-            if (result.value.truncated) {
-                problems.push(`${REPOS[i]}: more than 100 runs today, the oldest are not checked.`);
-            }
+            active.push(...result.value.active);
+            finished.push(...result.value.finished);
         } else if (result.reason.limited) {
             limited = true;
         } else {
@@ -276,18 +445,20 @@ async function refresh() {
     errors.textContent = problems.join(' ');
 
     if (results.every(result => result.status === 'rejected')) {
-        // Keep the last table rather than showing an empty queue
-        status.textContent = lastRefresh ? `Not updated, the table is from ${time(new Date(lastRefresh))}.`
+        // Keep the last tables rather than showing an empty queue
+        status.textContent = lastRefresh ? `Not updated, the tables are from ${time(new Date(lastRefresh))}.`
             : 'Could not load the runs.';
     } else {
-        const counts = render(rows);
+        const counts = render(active);
         const partial = results.some(result => result.status === 'rejected') ? ' Some repos are missing.' : '';
 
-        document.getElementById('empty').hidden = rows.length > 0 || partial !== '';
+        document.getElementById('empty').hidden = active.length > 0 || partial !== '';
         status.textContent = `${counts.started} started, ${counts.waiting} waiting. `
             + `Updated at ${time(new Date())}.${partial}`;
         lastRefresh = Date.now();
+        await renderFinished(finished);
     }
+
     document.getElementById('rate').textContent = rate
         ? `Requests left now: ${rate.remaining} of ${rate.limit}, until ${time(rate.reset)}.`
         : '';
