@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jitsi PR test queue</title>
+<style>
+  :root {
+    --bg: #fff; --fg: #222; --muted: #666; --line: #e3e3e3; --link: #0a58ca;
+    --code: #f4f4f4; --testing: #1a7f37; --waiting: #9a6700; --error: #cf222e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e; --line: #30363d; --link: #58a6ff;
+      --code: #161b22; --testing: #3fb950; --waiting: #d29922; --error: #f85149;
+    }
+  }
+  body { font-family: system-ui, sans-serif; max-width: 980px; margin: 3em auto; padding: 0 16px;
+         color: var(--fg); background: var(--bg); }
+  a { color: var(--link); }
+  code { background: var(--code); padding: 0.1em 0.3em; border-radius: 3px; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5em 1em; margin: 1em 0; }
+  button { font: inherit; padding: 0.3em 0.9em; cursor: pointer; }
+  .table { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.45em 0.6em; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; white-space: nowrap; }
+  td.repo, td.when, td.state { white-space: nowrap; }
+  .testing { color: var(--testing); font-weight: 600; }
+  .waiting { color: var(--waiting); }
+  .error { color: var(--error); }
+  .muted, small { color: var(--muted); }
+  small { display: block; font-size: 0.8em; line-height: 1.5; margin-top: 1.5em; }
+</style>
+</head>
+<body>
+<h1>Jitsi PR test queue</h1>
+<p>The PR test runs of jitsi-meet, lib-jitsi-meet, jicofo, jitsi-videobridge and jicoco that are waiting or running.
+Each repo's runner takes one run at a time, and the test machine tests one run at a time for all the repos.</p>
+
+<div class="bar">
+  <button id="refresh" type="button">Refresh</button>
+  <span id="status" class="muted">Loading…</span>
+</div>
+
+<div class="table">
+  <table>
+    <thead>
+      <tr><th>Repo</th><th>PR</th><th>Started by</th><th>State</th><th>Since</th><th>Run</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<p id="empty" class="muted" hidden>Nothing is waiting or running.</p>
+<p id="errors" class="error" hidden></p>
+
+<small>
+  <b>Waiting for the runner</b>: the repo's runner is busy with an earlier run of the same repo.
+  <b>Waiting for the test machine</b>: the run has its runner and waits for the run that is testing.
+  Of the runs that have their runner, the one that got it first is shown as testing. That is almost always right,
+  the run log on GitHub shows it for sure.<br>
+  This page reads the public GitHub API from your browser, without signing in. GitHub allows 60 such requests an
+  hour per IP address, shared by everyone behind the same address, and one refresh uses 5 to 10 of them, so about
+  6 to 12 refreshes an hour. The page refreshes every 10 minutes while it is open. <span id="rate"></span><br>
+  To run the tests of a PR again, comment <code>test this please</code> on it.
+  Reports of finished runs: <a href="../">jitsi.github.io/jitsi-pr-tests-pages</a>.
+</small>
+
+<script>
+'use strict';
+
+const REPOS = [ 'jitsi-meet', 'lib-jitsi-meet', 'jicofo', 'jitsi-videobridge', 'jicoco' ];
+const API = 'https://api.github.com/repos/jitsi/';
+const WAITING = new Set([ 'queued', 'waiting', 'pending', 'requested' ]);
+const REFRESH_MS = 10 * 60 * 1000;
+
+// Open PRs per repo, kept between refreshes; fetched again only when a run's PR isn't in them.
+const pullsCache = {};
+let rate = null;
+let lastRefresh = 0;
+let loading = false;
+
+async function get(path) {
+    const res = await fetch(API + path, { headers: { Accept: 'application/vnd.github+json' } });
+    const remaining = res.headers.get('x-ratelimit-remaining');
+
+    if (remaining !== null) {
+        rate = {
+            limit: Number(res.headers.get('x-ratelimit-limit')),
+            remaining: Number(remaining),
+            reset: new Date(Number(res.headers.get('x-ratelimit-reset')) * 1000)
+        };
+    }
+    if (!res.ok) {
+        const error = new Error(`GitHub answered ${res.status} for ${path}`);
+
+        error.limited = (res.status === 403 || res.status === 429) && rate && rate.remaining === 0;
+        throw error;
+    }
+
+    return res.json();
+}
+
+function time(date) {
+    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function ago(date) {
+    const minutes = Math.max(0, Math.round((Date.now() - date) / 60000));
+
+    return minutes < 60 ? `${minutes} min` : `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+function startedBy(run) {
+    const who = run.triggering_actor ? run.triggering_actor.login : run.actor.login;
+    const how = {
+        pull_request_target: 'push',
+        issue_comment: 'comment',
+        workflow_dispatch: 'Actions tab'
+    }[run.event] || run.event;
+
+    return `${how}, ${who}`;
+}
+
+function findPr(run, pulls) {
+    if (run.event === 'pull_request_target') {
+        return pulls.find(pr => pr.head.ref === run.head_branch
+            && pr.head.repo && run.head_repository && pr.head.repo.full_name === run.head_repository.full_name);
+    }
+    if (run.event === 'issue_comment') {
+        return pulls.find(pr => pr.title === run.display_title);
+    }
+}
+
+async function prOf(repo, run) {
+    // For runs on the default branch (comments, the Actions tab) pull_requests lists unrelated PRs
+    if (run.event === 'pull_request_target' && run.pull_requests.length === 1) {
+        return { number: run.pull_requests[0].number, title: run.display_title };
+    }
+    if (run.event === 'workflow_dispatch') {
+        return null;
+    }
+
+    let pr = pullsCache[repo] && findPr(run, pullsCache[repo]);
+
+    if (!pr) {
+        pullsCache[repo] = await get(`${repo}/pulls?state=open&sort=updated&direction=desc&per_page=100`);
+        pr = findPr(run, pullsCache[repo]);
+    }
+
+    return pr ? { number: pr.number, title: pr.title } : { number: null, title: run.display_title };
+}
+
+async function activeRuns(repo) {
+    // A queued run can wait for hours, but not for a day: the jobs time out
+    const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString().replace(/\.\d+Z$/, 'Z');
+    const data = await get(`${repo}/actions/workflows/pr-torture-trigger.yml/runs?per_page=100`
+        + `&created=${encodeURIComponent('>=' + since)}`);
+    const runs = data.workflow_runs.filter(run => run.status === 'in_progress' || WAITING.has(run.status));
+    const rows = [];
+
+    for (const run of runs) {
+        rows.push({ repo, run, pr: await prOf(repo, run) });
+    }
+
+    return { rows, truncated: data.total_count > data.workflow_runs.length };
+}
+
+function link(href, text) {
+    const a = document.createElement('a');
+
+    a.href = href;
+    a.textContent = text;
+
+    return a;
+}
+
+function cell(tr, content, className) {
+    const td = tr.insertCell();
+
+    if (className) {
+        td.className = className;
+    }
+    if (typeof content === 'string') {
+        td.textContent = content;
+    } else if (content) {
+        td.append(content);
+    }
+
+    return td;
+}
+
+function render(rows) {
+    // A run's updated_at is when it last changed state: for a started run, when it got its runner
+    const started = rows.filter(row => row.run.status === 'in_progress')
+        .sort((a, b) => new Date(a.run.updated_at) - new Date(b.run.updated_at));
+    const waiting = rows.filter(row => row.run.status !== 'in_progress')
+        .sort((a, b) => new Date(a.run.created_at) - new Date(b.run.created_at));
+    const tbody = document.getElementById('rows');
+
+    tbody.replaceChildren();
+    for (const row of [ ...started, ...waiting ]) {
+        const tr = tbody.insertRow();
+        const { repo, run, pr } = row;
+        cell(tr, repo, 'repo');
+
+        const prCell = cell(tr, null);
+
+        if (pr && pr.number) {
+            prCell.append(link(`https://github.com/jitsi/${repo}/pull/${pr.number}`, `#${pr.number}`), ` ${pr.title}`);
+        } else if (pr) {
+            prCell.textContent = pr.title;
+        } else {
+            prCell.textContent = 'the PR number is in the run';
+            prCell.className = 'muted';
+        }
+        cell(tr, startedBy(run));
+
+        let state, className, since;
+
+        if (run.status === 'in_progress') {
+            const testing = row === started[0];
+
+            state = testing ? 'Testing' : 'Waiting for the test machine';
+            className = testing ? 'testing' : 'waiting';
+            since = new Date(run.updated_at);
+        } else {
+            state = `Waiting for the ${repo} runner`;
+            className = 'waiting';
+            since = new Date(run.created_at);
+        }
+        cell(tr, state, `state ${className}`);
+        cell(tr, `${time(since)}, ${ago(since)}`, 'when');
+        cell(tr, link(run.html_url, 'run'));
+    }
+
+    return { started: started.length, waiting: waiting.length };
+}
+
+async function refresh() {
+    if (loading) {
+        return;
+    }
+    loading = true;
+
+    const button = document.getElementById('refresh');
+    const status = document.getElementById('status');
+    const errors = document.getElementById('errors');
+
+    button.disabled = true;
+    status.textContent = 'Loading…';
+
+    const results = await Promise.allSettled(REPOS.map(activeRuns));
+    const rows = [];
+    const problems = [];
+    let limited = false;
+
+    results.forEach((result, i) => {
+        if (result.status === 'fulfilled') {
+            rows.push(...result.value.rows);
+            if (result.value.truncated) {
+                problems.push(`${REPOS[i]}: more than 100 runs today, the oldest are not checked.`);
+            }
+        } else if (result.reason.limited) {
+            limited = true;
+        } else {
+            problems.push(`${REPOS[i]}: ${result.reason.message}.`);
+        }
+    });
+    if (limited) {
+        problems.unshift(`GitHub's limit of ${rate.limit} requests an hour for your IP address is used up `
+            + `until ${time(rate.reset)}.`);
+    }
+
+    errors.hidden = problems.length === 0;
+    errors.textContent = problems.join(' ');
+
+    if (results.every(result => result.status === 'rejected')) {
+        // Keep the last table rather than showing an empty queue
+        status.textContent = lastRefresh ? `Not updated, the table is from ${time(new Date(lastRefresh))}.`
+            : 'Could not load the runs.';
+    } else {
+        const counts = render(rows);
+        const partial = results.some(result => result.status === 'rejected') ? ' Some repos are missing.' : '';
+
+        document.getElementById('empty').hidden = rows.length > 0 || partial !== '';
+        status.textContent = `${counts.started} started, ${counts.waiting} waiting. `
+            + `Updated at ${time(new Date())}.${partial}`;
+        lastRefresh = Date.now();
+    }
+    document.getElementById('rate').textContent = rate
+        ? `Requests left now: ${rate.remaining} of ${rate.limit}, until ${time(rate.reset)}.`
+        : '';
+
+    loading = false;
+    button.disabled = false;
+}
+
+document.getElementById('refresh').addEventListener('click', refresh);
+setInterval(() => {
+    if (document.visibilityState === 'visible') {
+        refresh();
+    }
+}, REFRESH_MS);
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && Date.now() - lastRefresh > REFRESH_MS) {
+        refresh();
+    }
+});
+refresh();
+</script>
+</body>
+</html>

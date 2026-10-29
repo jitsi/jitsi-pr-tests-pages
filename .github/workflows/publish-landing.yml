@@ -1,0 +1,69 @@
+name: publish-landing
+# Copies the hand-written pages of main (the landing page and the queue page) to gh-pages, which GitHub
+# Pages serves. Everything else on gh-pages is written by publish-pr-results.sh and prune.yml.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - index.html
+      - queue/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gh-pages-landing
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src
+
+      # Only the root files and queue/ of gh-pages, not the reports
+      - uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: pages
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            /index.html
+            /.nojekyll
+            /queue/
+          sparse-checkout-cone-mode: false
+
+      - name: Copy the pages and push
+        working-directory: pages
+        run: |
+          set -euo pipefail
+          git config user.name  "jitsi-ci"
+          git config user.email "jitsi-ci@users.noreply.github.com"
+
+          # Publishes and the prune (which replaces gh-pages with a new root commit) can move the
+          # branch meanwhile: start again from its newest commit when the push is rejected
+          for n in 1 2 3 4 5; do
+            git fetch -q --depth 1 --filter=blob:none origin gh-pages
+            git reset -q --hard FETCH_HEAD
+            cp ../src/index.html index.html
+            rm -rf queue
+            cp -R ../src/queue queue
+            git add -A index.html queue
+            if git diff --cached --quiet; then
+              echo "gh-pages is up to date."
+              exit 0
+            fi
+            git commit -q -m "landing: publish ${GITHUB_SHA::7} from main"
+            if git push -q origin HEAD:gh-pages; then
+              echo "pushed on attempt ${n}."
+              exit 0
+            fi
+            echo "gh-pages moved, retrying (${n})..."
+            sleep 5
+          done
+          echo "publish failed after retries" >&2
+          exit 1

@@ -7,6 +7,16 @@ This repository **only stores generated CI artifacts**. Do not edit branches
 other than `main` (landing page sources) by hand. The `gh-pages` branch is
 machine-managed by the Jitsi PR test pipeline.
 
+## Pages on `main`
+
+`index.html` (the landing page) and `queue/index.html` are written by hand on `main`.
+`.github/workflows/publish-landing.yml` copies them to `gh-pages` on every push to `main`
+that changes them.
+
+The queue page, <https://jitsi.github.io/jitsi-pr-tests-pages/queue/>, lists the PR test runs
+of jitsi-meet, lib-jitsi-meet, jicofo, jitsi-videobridge and jicoco that are waiting or running.
+It reads the public GitHub API from the browser, without a token.
+
 ## URL layout
 
 Reports are pushed by `publish-pr-results.sh` (from
