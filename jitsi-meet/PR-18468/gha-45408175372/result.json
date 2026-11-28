@@ -1,0 +1,1 @@
+{"conclusion":"failure","title":"Jicofo log: Too many lines in file jicofo.log.txt (8061 lines, threshold 8000) · 668 tests · 635 passed · 0 failed · 0 errors · 33 skipped","repo":"jitsi/jitsi-meet","pr":18468,"build":"gha-45408175372","sha":"e9656df10b94b06c108742cd51056f77659cc111","published_at":"2026-11-24T14:19:23.473Z"}

@@ -1,0 +1,1 @@
+{"conclusion":"failure","title":"Too many discarded packets from node DiscardableDiscarder: 12988, limit 12000 · 682 tests · 598 passed · 7 failed · 0 errors · 77 skipped","repo":"jitsi/jitsi-meet","pr":18413,"build":"gha-44627233786","sha":"98ff7860c21583cdb86d20bdfe0fa8fbe06c8e75","published_at":"2026-11-19T22:36:09.414Z"}
